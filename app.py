@@ -226,6 +226,10 @@ df = df.dropna(subset=[TOTAL_COL, DISC_COL, NOM_COL, PRENOM_COL, GENDER_COL])
 def normalize_epreuve(ep: str) -> str | None:
     s = str(ep).upper().strip()
 
+    excluded_tokens = ["APRES FINALE", "APRÈS FINALES", "CDF CLUB"]
+    if any(tok in s for tok in excluded_tokens):
+        return None
+
     # Carabine 10m
     if "CARABINE 10" in s and "ECOLES DE TIR" not in s and "HP -" not in s:
         return "Carabine 10m"
