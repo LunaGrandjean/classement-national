@@ -206,6 +206,7 @@ PRENOM_COL = "Prenom"
 DATE_COL = "Date de début"
 COMP_COL = "Compétition"
 AGE_CAT_COL = "Catégorie E"
+COMP_TYPE_COL = "Type compétition"
 
 # CLEAN
 df[TOTAL_COL] = df[TOTAL_COL].astype(str).str.replace(",", ".", regex=False)
@@ -219,6 +220,49 @@ if AGE_CAT_COL in df.columns:
     df[AGE_CAT_COL] = df[AGE_CAT_COL].astype(str).str.strip().str.upper()
 
 df = df.dropna(subset=[TOTAL_COL, DISC_COL, NOM_COL, PRENOM_COL, GENDER_COL])
+
+# =========================================================
+# TYPE DE COMPÉTITION
+# =========================================================
+def normalize_text(s: str) -> str:
+    s = str(s).upper().strip()
+    replacements = {
+        "É": "E", "È": "E", "Ê": "E", "Ë": "E",
+        "À": "A", "Â": "A", "Ä": "A",
+        "Î": "I", "Ï": "I",
+        "Ô": "O", "Ö": "O",
+        "Ù": "U", "Û": "U", "Ü": "U",
+        "Ç": "C",
+        "Œ": "OE",
+        "’": "'", "–": "-", "—": "-"
+    }
+    for a, b in replacements.items():
+        s = s.replace(a, b)
+    return s
+
+def classify_competition_type(comp_name: str) -> str:
+    s = normalize_text(comp_name)
+
+    if (
+        "CHAMPIONNAT DE FRANCE" in s
+        or "CHAMPIONNATS DE FRANCE" in s
+        or "CDF" in s
+    ):
+        return "Championnat de France"
+
+    if "REGION" in s or "LIGUE" in s or "REGIONAL" in s:
+        return "Régional"
+
+    if "DEPART" in s or "DEPARTEMENTAL" in s or "DEPARTEMENTAUX" in s:
+        return "Départemental"
+
+    if any(x in s for x in ["CHALLENGE", "CRITERIUM", "COUPE", "OPEN", "AMICAL", "TROPHEE", "TOURNOI"]):
+        return "Challenge / Open"
+
+    return "Autre"
+
+df[COMP_COL] = df[COMP_COL].astype(str).str.strip()
+df[COMP_TYPE_COL] = df[COMP_COL].apply(classify_competition_type)
 
 # =========================================================
 # EPREUVES A GARDER + NOMS NETTOYES
@@ -335,9 +379,31 @@ with st.sidebar:
         default=[]
     )
 
+    comp_type_options = sorted(df[COMP_TYPE_COL].dropna().unique().tolist())
+    comp_type_choices = st.multiselect(
+        "Type(s) de compétition",
+        options=comp_type_options,
+        default=[]
+    )
+
+    competition_options = sorted(df[COMP_COL].dropna().unique().tolist())
+    competition_choices = st.multiselect(
+        "Compétition(s)",
+        options=competition_options,
+        default=[]
+    )
+
+    st.divider()
+    st.subheader("Mode de classement")
+    ranking_mode = st.selectbox(
+        "Calcul",
+        ["Classement national (basique)", "4 meilleurs", "Pondéré"],
+        index=0
+    )
+
     st.divider()
     st.subheader("Performance")
-    fast_mode = st.toggle("Mode rapide (recommandé)", value=True)
+    fast_mode = st.toggle("Mode rapide", value=True)
     top_n = st.slider("Lignes à afficher", 50, 2000, 300, step=50)
 
 base = df.copy()
@@ -348,6 +414,10 @@ if sex_choice != "Tous":
     base = base[base[GENDER_COL] == sex_choice]
 if age_choices:
     base = base[base["cat_age"].isin(age_choices)]
+if comp_type_choices:
+    base = base[base[COMP_TYPE_COL].isin(comp_type_choices)]
+if competition_choices:
+    base = base[base[COMP_COL].isin(competition_choices)]
 
 if age_choices:
     if len(age_choices) == 1:
@@ -361,6 +431,21 @@ base = base.copy()
 base["ranking_cat"] = ranking_cat_label
 
 st.caption(f"{len(base):,} lignes après filtres globaux")
+
+active_filters = []
+
+if comp_type_choices:
+    active_filters.append("Type compétition : " + ", ".join(comp_type_choices))
+
+if competition_choices:
+    preview = competition_choices[:3]
+    txt = ", ".join(preview)
+    if len(competition_choices) > 3:
+        txt += f" ... (+{len(competition_choices)-3})"
+    active_filters.append("Compétitions : " + txt)
+
+if active_filters:
+    st.caption(" • ".join(active_filters))
 
 # HELPERS
 def per_discipline_table(data: pd.DataFrame) -> pd.DataFrame:
@@ -393,6 +478,89 @@ def compute_ranking(data: pd.DataFrame) -> pd.DataFrame:
     r = r.sort_values(["moyenne", "meilleur"], ascending=False).reset_index(drop=True)
     r.insert(0, "Rang", np.arange(1, len(r) + 1))
     return r
+
+def add_weight_coef(data: pd.DataFrame, window_months: int = 12, k: float = 0.3) -> pd.DataFrame:
+    d = data.copy()
+    d = d.dropna(subset=[DATE_COL]).copy()
+
+    today = pd.Timestamp.today().normalize()
+    d["delta_months"] = (
+        (today.year - d[DATE_COL].dt.year) * 12
+        + (today.month - d[DATE_COL].dt.month)
+    )
+
+    d = d[d["delta_months"] <= window_months].copy()
+
+    if d.empty:
+        return d
+
+    delta = np.minimum(d["delta_months"], window_months)
+    d["coef"] = 1 - np.exp(k * delta) / np.exp(k * window_months) + 1 / np.exp(k * window_months)
+    return d
+
+def compute_ranking_basique(data: pd.DataFrame) -> pd.DataFrame:
+    r = per_discipline_table(data)
+    r["moyenne"] = r["moyenne"].round(2)
+    r["meilleur"] = r["meilleur"].round(2)
+    r = r.sort_values(["moyenne", "meilleur"], ascending=False).reset_index(drop=True)
+    r.insert(0, "Rang", np.arange(1, len(r) + 1))
+    return r
+
+def compute_ranking_top4(data: pd.DataFrame) -> pd.DataFrame:
+    group_cols = [DISC_COL, "ranking_cat", NOM_COL, PRENOM_COL, GENDER_COL]
+
+    top4 = (
+        data.sort_values(group_cols + [TOTAL_COL], ascending=[True, True, True, True, True, False])
+            .groupby(group_cols, as_index=False, group_keys=False)
+            .head(4)
+    )
+
+    r = (
+        top4.groupby(group_cols, as_index=False)
+            .agg(
+                matchs=(TOTAL_COL, "count"),
+                moyenne=(TOTAL_COL, "mean"),
+                meilleur=(TOTAL_COL, "max"),
+            )
+    )
+
+    r["moyenne"] = r["moyenne"].round(2)
+    r["meilleur"] = r["meilleur"].round(2)
+    r = r.sort_values(["moyenne", "meilleur"], ascending=False).reset_index(drop=True)
+    r.insert(0, "Rang", np.arange(1, len(r) + 1))
+    return r
+
+def compute_ranking_pondere(data: pd.DataFrame) -> pd.DataFrame:
+    d = add_weight_coef(data, window_months=12, k=0.3)
+
+    if d.empty:
+        cols = ["Rang", DISC_COL, "ranking_cat", NOM_COL, PRENOM_COL, GENDER_COL, "matchs", "moyenne", "meilleur"]
+        return pd.DataFrame(columns=cols)
+
+    group_cols = [DISC_COL, "ranking_cat", NOM_COL, PRENOM_COL, GENDER_COL]
+
+    r = (
+        d.groupby(group_cols, as_index=False)
+         .apply(lambda x: pd.Series({
+             "matchs": x[TOTAL_COL].count(),
+             "moyenne": (x[TOTAL_COL] * x["coef"]).sum() / x["coef"].sum(),
+             "meilleur": x[TOTAL_COL].max()
+         }))
+         .reset_index(drop=True)
+    )
+
+    r["moyenne"] = r["moyenne"].round(2)
+    r["meilleur"] = r["meilleur"].round(2)
+    r = r.sort_values(["moyenne", "meilleur"], ascending=False).reset_index(drop=True)
+    r.insert(0, "Rang", np.arange(1, len(r) + 1))
+    return r
+
+def compute_ranking_by_mode(data: pd.DataFrame, mode: str) -> pd.DataFrame:
+    if mode == "4 meilleurs":
+        return compute_ranking_top4(data)
+    if mode == "Pondéré":
+        return compute_ranking_pondere(data)
+    return compute_ranking_basique(data)
 
 def style_top3_only(df_show: pd.DataFrame):
     def row_style(i):
@@ -429,7 +597,7 @@ def add_rank_within_discipline(t: pd.DataFrame) -> pd.DataFrame:
 
 # PAGE CLASSEMENT
 if page == "Classement":
-    ranking = compute_ranking(base)
+    ranking = compute_ranking_by_mode(base, ranking_mode)
 
     st.markdown("## Podium 🏅")
     top3 = ranking.head(3).copy()
@@ -475,7 +643,7 @@ if page == "Classement":
 
     st.write("")
 
-    st.subheader("Classement (moyenne de tous les matchs)")
+    st.subheader(f"Classement – {ranking_mode}")
 
     table_df = ranking.rename(columns={
         DISC_COL: "Épreuve",
@@ -577,7 +745,7 @@ else:
     )
 
     st.markdown("### Détails des matchs")
-    cols_detail = ["cat_label", COMP_COL, DATE_COL, DISC_COL, TOTAL_COL, "Nombre 10", "Nombre 9", "Nombre Mouches"]
+    cols_detail = ["cat_label", COMP_COL, COMP_TYPE_COL, DATE_COL, DISC_COL, TOTAL_COL, "Nombre 10", "Nombre 9", "Nombre Mouches"]
     cols_detail = [c for c in cols_detail if c in ath_view.columns]
 
     detail = ath_view.sort_values(DATE_COL, ascending=False).copy()
@@ -587,6 +755,7 @@ else:
         detail[cols_detail].rename(columns={
             "cat_label": "Catégorie",
             COMP_COL: "Compétition",
+            COMP_TYPE_COL: "Type compétition",
             DATE_COL: "Date",
             DISC_COL: "Épreuve",
             TOTAL_COL: "Total Séries"
